@@ -13,13 +13,11 @@ public:
     void loop();
     bool publish(const String& topic, const String& payload);
     void onMessage(MsgCallback cb) { _msgCb = cb; }
-    bool connected()  { return _client.connected(); }
+    bool connected() { return _client.connected(); }
 
-    // 上行主题约定
-    String topicEvent()  const { return "device/" + _deviceId + "/event"; }
-    String topicState()  const { return "device/" + _deviceId + "/state"; }
-    // 下行主题
-    String topicCmd()    const { return "device/" + _deviceId + "/cmd"; }
+    String topicEvent() const { return "attributes"; }
+    String topicState() const { return "attributes"; }
+    String topicCmd()   const { return "attributes/push"; }
 
 private:
     WiFiClient   _wifi;
@@ -32,5 +30,5 @@ private:
 
     bool _connect();
     static void _staticCb(char* topic, byte* payload, unsigned int len);
-    static MqttManager* _instance;   // PubSubClient 回调需要静态桥接
+    static MqttManager* _instance;
 };

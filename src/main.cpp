@@ -22,14 +22,15 @@ void setup() {
     serial.onCfg([](const CfgMsg& msg) {
         Serial.printf("[Cfg] ssid=%s room=%s\n", msg.ssid.c_str(), msg.room.c_str());
         cfgMgr.save(msg.ssid, msg.pwd, msg.room);
-        DeviceCfg cfg = cfgMgr.load();
-        wifiMgr.begin(cfg.ssid, cfg.password);
+        wifiMgr.begin(msg.ssid, msg.pwd);
     });
 
     wifiMgr.onStateChange([](WifiState s) {
         if (s == WifiState::CONNECTED) {
+            Serial.println("[WiFi] Connected, starting MQTT...");
             DeviceCfg cfg = cfgMgr.load();
-            mqttMgr.begin(cfg.mqttHost, cfg.mqttPort, cfg.deviceId, cfg.roomNo);
+            mqttMgr.begin("sh-1-mqtt.iot-api.com", 1883,
+                          cfg.deviceId, cfg.roomNo);
         }
     });
 
@@ -37,11 +38,14 @@ void setup() {
         Serial.printf("[MQTT] <- %s : %s\n", topic.c_str(), payload.c_str());
     });
 
-    // 直接填真实 WiFi 先测通网络
-    wifiMgr.begin("GZJG", "88888888");
-    DeviceCfg cfg = cfgMgr.load();
-    // 把第43行改成这样
-mqttMgr.begin("broker.emqx.io", 1883, cfg.deviceId, cfg.roomNo);
+    // 上电读取已保存配置，有就自动连，没有就等串口下发
+    DeviceCfg saved = cfgMgr.load();
+    if (saved.valid) {
+        Serial.printf("[Boot] 已有配置 ssid=%s，自动连接\n", saved.ssid.c_str());
+        wifiMgr.begin(saved.ssid, saved.password);
+    } else {
+        Serial.println("[Boot] 无配置，等待串口下发 cfg 消息");
+    }
 }
 
 void loop() {
