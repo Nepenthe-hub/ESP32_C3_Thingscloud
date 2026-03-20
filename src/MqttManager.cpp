@@ -1,18 +1,38 @@
 #include "MqttManager.h"
+#include <ArduinoJson.h>
 
 MqttManager* MqttManager::_instance = nullptr;
-/*
-    静态回调函数，用于处理接收到的MQTT消息
-*/
+
 void MqttManager::_staticCb(char* topic, byte* payload, unsigned int len) {
-    if (!_instance || !_instance->_msgCb) return;
+    if (!_instance) return;
     String t(topic);
     String p((char*)payload, len);
-    _instance->_msgCb(t, p);
+
+    // ── 新增：OTA 指令主题单独处理 ──────────────────────────────
+    // 期望收到的 payload 格式：
+    // { "url": "http://192.168.1.100:8080/firmware.bin", "version": "1.0.1" }
+    // version 字段可选，仅用于日志打印
+    if (_instance->_otaCb && t == _instance->topicOtaUpdate()) {
+        JsonDocument doc;
+        if (deserializeJson(doc, p) == DeserializationError::Ok) {
+            String url     = doc["url"]     | "";
+            String version = doc["version"] | "";
+            if (!url.isEmpty()) {
+                Serial.printf("[MQTT] OTA trigger received, url=%s ver=%s\n",
+                              url.c_str(), version.c_str());
+                _instance->_otaCb(url, version);
+                return;  // OTA 和普通消息互斥，直接返回
+            }
+        }
+        Serial.println("[MQTT] OTA payload invalid, ignored");
+        return;
+    }
+    // ────────────────────────────────────────────────────────────
+
+    // 普通业务消息走原来的回调
+    if (_instance->_msgCb) _instance->_msgCb(t, p);
 }
-/*
-    begin: 初始化MQTT客户端，设置服务器地址、端口、设备ID、房间号等信息，并注册回调函数
-*/
+
 void MqttManager::begin(const String& host, uint16_t port,
                          const String& deviceId, const String& roomNo) {
     _host     = host;
@@ -27,12 +47,10 @@ void MqttManager::begin(const String& host, uint16_t port,
     _client.setKeepAlive(60);
     _client.setBufferSize(512);
 }
-/*
-    _connect: 尝试连接MQTT服务器，连接成功后订阅命令主题，并发布在线状态消息
-*/
+
 bool MqttManager::_connect() {
     Serial.printf("[MQTT] Connecting to host=%s port=%d\n", _host.c_str(), _port);
-    String clientId = "esp32-" + _deviceId;
+    String clientId  = "esp32-" + _deviceId;
     String lwtPayload = "{\"online\":false}";
 
     bool ok = _client.connect(
@@ -44,20 +62,20 @@ bool MqttManager::_connect() {
     );
 
     if (ok) {
-       Serial.println("[MQTT] Connected");
+        Serial.println("[MQTT] Connected");
         _client.subscribe(topicCmd().c_str());
+        // ── 新增：同时订阅 OTA 指令主题 ──
+        _client.subscribe(topicOtaUpdate().c_str());
+        Serial.printf("[MQTT] Subscribed: %s\n", topicOtaUpdate().c_str());
+        // ─────────────────────────────────
         String payload = "{\"online\":true}";
         publish(topicEvent(), payload);
-        Serial.printf("[MQTT] Published: %s\n", payload.c_str());
     } else {
         Serial.printf("[MQTT] Connect failed, rc=%d\n", _client.state());
     }
     return ok;
 }
-/*
-    loop: MQTT客户端的主循环函数，负责保持连接和处理消息
-    如果当前没有连接，就会定期尝试重新连接
-*/
+
 void MqttManager::loop() {
     if (_host.isEmpty()) return;
     if (_client.connected()) {
@@ -70,10 +88,7 @@ void MqttManager::loop() {
         _connect();
     }
 }
-/*
-    publish: 发布MQTT消息到指定主题
-    如果当前没有连接，就返回false
-*/
+
 bool MqttManager::publish(const String& topic, const String& payload) {
     if (!_client.connected()) return false;
     return _client.publish(topic.c_str(), payload.c_str(), false);
