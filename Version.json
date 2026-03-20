@@ -1,4 +1,4 @@
 {
-  "version": "1.0.1",
-  "url": "http://192.168.111.123:8080/firmware.bin"
+  "version": "1.0.3",
+  "url": "https://github.com/Nepenthe-hub/ESP32_C3_Thingscloud/releases/download/v1.0.2/firmware.bin"
 }
