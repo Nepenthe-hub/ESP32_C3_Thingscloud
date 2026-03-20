@@ -15,7 +15,7 @@ OtaManager     otaMgr;   // 新增
 // ── OTA 服务器地址，改成你电脑的局域网 IP ──────────────────────
 // 运行 python -m http.server 8080 的那台电脑的 IP
 // Windows: ipconfig  /  Mac/Linux: ifconfig
-static const char* OTA_VERSION_URL = "http://192.168.111.123:8080/version.json";
+static const char* OTA_VERSION_URL = "https://raw.githubusercontent.com/Nepenthe-hub/ESP32_C3_Thingscloud/main/Version.json";
 void sendToSTM32(int speed, int dir, const String& op) {
     char buf[128];
     snprintf(buf, sizeof(buf), "$CMD,%d,%d,%s\n", speed, dir, op.c_str());
@@ -28,7 +28,7 @@ void setup() {
     Serial.begin(115200);
     uint32_t t = millis();
     while (!Serial && millis() - t < 2000) delay(10);
-    Serial.printf("[Boot] Starting... Firmware v%s  ← 这是新版本!\n", OtaManager::currentVersion());
+    Serial.printf("[Boot] Starting... Firmware v%s - remote OTA test!\n", OtaManager::currentVersion());
 
     Serial1.begin(115200, SERIAL_8N1, 6, 7);
     Serial.println("[Boot] Serial1 (STM32) ready");
