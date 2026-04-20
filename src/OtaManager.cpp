@@ -1,6 +1,6 @@
 #include "OtaManager.h"
 #include <HTTPClient.h>
-#include <WiFiClientSecure.h>  // 改用 HTTPS 客户端
+#include <WiFiClientSecure.h>
 #include <Update.h>
 #include <ArduinoJson.h>
 
@@ -10,25 +10,17 @@ void OtaManager::_setState(OtaState s, const String& info) {
 
 // ─────────────────────────────────────────────
 //  checkAndUpdate
-//  从 versionUrl 下载 version.json，对比版本号，需要则升级
-//
-//  version.json 格式：
-//  {
-//    "version": "1.0.2",
-//    "url": "https://github.com/.../firmware.bin"
-//  }
 // ─────────────────────────────────────────────
 void OtaManager::checkAndUpdate(const String& versionUrl) {
     _setState(OtaState::CHECKING, "");
     Serial.printf("[OTA] Checking version at: %s\n", versionUrl.c_str());
 
     WiFiClientSecure secClient;
-    secClient.setInsecure();  // 跳过证书验证，省去维护根证书的麻烦
+    secClient.setInsecure();
 
     HTTPClient http;
     http.begin(secClient, versionUrl);
-    http.setTimeout(8000);
-    // GitHub 会 302 跳转到 CDN，必须允许跟随跳转
+    http.setTimeout(15000);
     http.setFollowRedirects(HTTPC_STRICT_FOLLOW_REDIRECTS);
 
     int code = http.GET();
@@ -36,6 +28,9 @@ void OtaManager::checkAndUpdate(const String& versionUrl) {
         Serial.printf("[OTA] Version check failed, HTTP code: %d\n", code);
         http.end();
         _setState(OtaState::FAILED, "http_" + String(code));
+        Serial.println("[OTA] Retrying in 10s...");
+        delay(10000);
+        ESP.restart();
         return;
     }
 
@@ -82,37 +77,75 @@ void OtaManager::performUpdate(const String& binUrl) {
 }
 
 // ─────────────────────────────────────────────
+//  _httpsGet：手动处理跳转，避免两次 SSL 握手同时占内存
+// ─────────────────────────────────────────────
+int OtaManager::_httpsGet(WiFiClientSecure& client, HTTPClient& http,
+                           const String& url) {
+    http.begin(client, url);
+    http.setTimeout(20000);
+    http.setFollowRedirects(HTTPC_DISABLE_FOLLOW_REDIRECTS);
+
+    int code = http.GET();
+    Serial.printf("[OTA] HTTP %d for %s\n", code, url.c_str());
+
+    if (code == 301 || code == 302) {
+        String location = http.getLocation();
+        http.end();
+        Serial.printf("[OTA] Redirect -> %s\n", location.c_str());
+        http.begin(client, location);
+        http.setTimeout(60000);
+        code = http.GET();
+        Serial.printf("[OTA] HTTP %d after redirect\n", code);
+    }
+
+    return code;
+}
+
+// ─────────────────────────────────────────────
 //  _doUpdate（核心）
-//  HTTPS 流式下载 .bin，写入备用 OTA 分区，校验后重启
+//  失败时自动等 10 秒重启重试，不需要手动按 RST
 // ─────────────────────────────────────────────
 bool OtaManager::_doUpdate(const String& binUrl) {
     _setState(OtaState::DOWNLOADING, binUrl);
 
     WiFiClientSecure secClient;
-    secClient.setInsecure();  // 跳过证书验证
+    secClient.setInsecure();
 
     HTTPClient http;
-    http.begin(secClient, binUrl);
-    http.setTimeout(60000);
-    // GitHub releases 会跳转到 objects.githubusercontent.com，必须跟随
-    http.setFollowRedirects(HTTPC_STRICT_FOLLOW_REDIRECTS);
+    int code = _httpsGet(secClient, http, binUrl);
 
-    int code = http.GET();
     if (code != 200) {
         Serial.printf("[OTA] Download failed, HTTP code: %d\n", code);
         http.end();
         _setState(OtaState::FAILED, "http_" + String(code));
+        Serial.println("[OTA] Retrying in 10s...");
+        delay(10000);
+        ESP.restart();
         return false;
     }
 
     int totalSize = http.getSize();
     Serial.printf("[OTA] Firmware size: %d bytes\n", totalSize);
 
-    if (!Update.begin(totalSize > 0 ? totalSize : UPDATE_SIZE_UNKNOWN)) {
+    // totalSize == -1 说明服务器返回的不是固件，自动重试
+    if (totalSize == -1) {
+        Serial.println("[OTA] Invalid firmware size, server not ready yet.");
+        http.end();
+        _setState(OtaState::FAILED, "invalid_size");
+        Serial.println("[OTA] Retrying in 10s...");
+        delay(10000);
+        ESP.restart();
+        return false;
+    }
+
+    if (!Update.begin(totalSize)) {
         String errMsg = Update.errorString();
         Serial.printf("[OTA] Update.begin failed: %s\n", errMsg.c_str());
         http.end();
         _setState(OtaState::FAILED, errMsg);
+        Serial.println("[OTA] Retrying in 10s...");
+        delay(10000);
+        ESP.restart();
         return false;
     }
 
@@ -133,6 +166,9 @@ bool OtaManager::_doUpdate(const String& binUrl) {
         String errMsg = Update.errorString();
         Serial.printf("[OTA] Update.end failed: %s\n", errMsg.c_str());
         _setState(OtaState::FAILED, errMsg);
+        Serial.println("[OTA] Retrying in 10s...");
+        delay(10000);
+        ESP.restart();
         return false;
     }
 

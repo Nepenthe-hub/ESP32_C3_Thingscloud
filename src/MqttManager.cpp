@@ -8,37 +8,44 @@ void MqttManager::_staticCb(char* topic, byte* payload, unsigned int len) {
     String t(topic);
     String p((char*)payload, len);
 
-    // ── 新增：OTA 指令主题单独处理 ──────────────────────────────
-    // 期望收到的 payload 格式：
-    // { "url": "http://192.168.1.100:8080/firmware.bin", "version": "1.0.1" }
-    // version 字段可选，仅用于日志打印
-    if (_instance->_otaCb && t == _instance->topicOtaUpdate()) {
+    if (t == _instance->topicCommand()) {
         JsonDocument doc;
-        if (deserializeJson(doc, p) == DeserializationError::Ok) {
-            String url     = doc["url"]     | "";
-            String version = doc["version"] | "";
-            if (!url.isEmpty()) {
-                Serial.printf("[MQTT] OTA trigger received, url=%s ver=%s\n",
-                              url.c_str(), version.c_str());
-                _instance->_otaCb(url, version);
-                return;  // OTA 和普通消息互斥，直接返回
+        if (deserializeJson(doc, p) != DeserializationError::Ok) return;
+
+        String method = doc["method"] | "";
+
+        if (method == "otaUpgrade") {
+            bool   upgrade = doc["params"]["upgrade"] | false;
+            String version = doc["params"]["version"] | "";
+            String url     = doc["params"]["url"]     | "";
+
+            if (!upgrade) {
+                Serial.println("[OTA] Already up to date (ThingsCloud)");
+                return;
             }
+            Serial.printf("[OTA] ThingsCloud push: ver=%s url=%s\n",
+                          version.c_str(), url.c_str());
+            if (_instance->_otaCb && !url.isEmpty()) {
+                _instance->_otaCb(url, version);
+            }
+            return;
         }
-        Serial.println("[MQTT] OTA payload invalid, ignored");
+
+        if (_instance->_msgCb) _instance->_msgCb(t, p);
         return;
     }
-    // ────────────────────────────────────────────────────────────
 
-    // 普通业务消息走原来的回调
     if (_instance->_msgCb) _instance->_msgCb(t, p);
 }
 
 void MqttManager::begin(const String& host, uint16_t port,
-                         const String& deviceId, const String& roomNo) {
+                         const String& deviceId, const String& roomNo,
+                         const String& token) {
     _host     = host;
     _port     = port;
     _deviceId = deviceId;
     _roomNo   = roomNo;
+    _token    = token;   // 🔧 保存 Token
     _instance = this;
 
     _client.setClient(_wifi);
@@ -49,14 +56,23 @@ void MqttManager::begin(const String& host, uint16_t port,
 }
 
 bool MqttManager::_connect() {
-    Serial.printf("[MQTT] Connecting to host=%s port=%d\n", _host.c_str(), _port);
-    String clientId  = "esp32-" + _deviceId;
+    if (_token.isEmpty()) {
+        // 🔧 Token 为空时拒绝连接，防止被服务器以 rc=5 踢掉污染重连计时
+        Serial.println("[MQTT] Token is empty, skipping connect. Please configure token.");
+        return false;
+    }
+
+    Serial.printf("[MQTT] Connecting to host=%s port=%d id=%s\n",
+                  _host.c_str(), _port, _deviceId.c_str());
+
+    String clientId   = "esp32-" + _deviceId;
     String lwtPayload = "{\"online\":false}";
 
+    // 🔧 用户名固定为项目 Access Key，密码使用每设备独立的 Token
     bool ok = _client.connect(
         clientId.c_str(),
-        "9a7lf0qlp3p9odgq",
-        "rg8EHtRQ3R",
+        "9a7lf0qlp3p9odgq",   // ThingsCloud 项目 Access Key（所有设备共用）
+        _token.c_str(),         // 🔧 每设备独立的 Device Token
         topicState().c_str(), 0, true,
         lwtPayload.c_str()
     );
@@ -64,14 +80,25 @@ bool MqttManager::_connect() {
     if (ok) {
         Serial.println("[MQTT] Connected");
         _client.subscribe(topicCmd().c_str());
-        // ── 新增：同时订阅 OTA 指令主题 ──
-        _client.subscribe(topicOtaUpdate().c_str());
-        Serial.printf("[MQTT] Subscribed: %s\n", topicOtaUpdate().c_str());
-        // ─────────────────────────────────
-        String payload = "{\"online\":true}";
-        publish(topicEvent(), payload);
+        Serial.printf("[MQTT] Subscribed: %s\n", topicCmd().c_str());
+        _client.subscribe(topicCommand().c_str());
+        Serial.printf("[MQTT] Subscribed: %s\n", topicCommand().c_str());
+        publish(topicState(), "{\"online\":true}");
     } else {
-        Serial.printf("[MQTT] Connect failed, rc=%d\n", _client.state());
+        int rc = _client.state();
+        Serial.printf("[MQTT] Connect failed, rc=%d", rc);
+        // 打印常见错误原因，方便现场排查
+        switch (rc) {
+            case -4: Serial.println(" (TIMEOUT)");           break;
+            case -3: Serial.println(" (LOST)");              break;
+            case -2: Serial.println(" (FAILED)");            break;
+            case  1: Serial.println(" (BAD_PROTOCOL)");      break;
+            case  2: Serial.println(" (BAD_CLIENT_ID)");     break;
+            case  3: Serial.println(" (UNAVAILABLE)");       break;
+            case  4: Serial.println(" (BAD_CREDENTIALS) <- Token 错误或未在 ThingsCloud 注册此设备"); break;
+            case  5: Serial.println(" (UNAUTHORIZED)");      break;
+            default: Serial.println("");                      break;
+        }
     }
     return ok;
 }

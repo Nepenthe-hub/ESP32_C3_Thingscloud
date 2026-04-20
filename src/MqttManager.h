@@ -5,28 +5,34 @@
 #include <functional>
 
 using MsgCallback = std::function<void(const String&, const String&)>;
-// OTA 专用回调：url（固件地址）、version（目标版本，可为空）
 using OtaCallback = std::function<void(const String& url, const String& version)>;
 
 class MqttManager {
 public:
+    // 🔧 新增 token 参数，对应 ThingsCloud 每设备独立的 Device Token
     void begin(const String& host, uint16_t port,
-               const String& deviceId, const String& roomNo);
+               const String& deviceId, const String& roomNo,
+               const String& token);
     void loop();
     bool publish(const String& topic, const String& payload);
 
     void onMessage(MsgCallback cb) { _msgCb = cb; }
-    void onOta(OtaCallback cb)     { _otaCb = cb; }  // 新增：注册OTA触发回调
+    void onOta(OtaCallback cb)     { _otaCb = cb; }
 
-    // 主题生成
-    String topicCmd()   { return "attribute/" + _deviceId + "/set"; }
-    String topicEvent() { return "attribute/" + _deviceId + "/event"; }
-    String topicState() { return "attribute/" + _deviceId + "/state"; }
-    // 新增：OTA 相关主题
-    // 接收升级指令：ota/{deviceId}/update
-    String topicOtaUpdate() { return "ota/" + _deviceId + "/update"; }
-    // 上报升级状态：ota/{deviceId}/status
-    String topicOtaStatus() { return "ota/" + _deviceId + "/status"; }
+    bool isConnected()  { return _client.connected(); }
+    void disconnect()   { _client.disconnect(); }
+
+    // ─── ThingsCloud 标准主题 ───
+    String topicAttrReport()  { return "attributes"; }
+    String topicCmd()         { return "attributes/push"; }
+    String topicEvent()       { return "events"; }
+    String topicCommand()     { return "commands/send"; }
+    String topicCmdReply(int id) {
+        return "commands/reply/" + String(id);
+    }
+    // 🔧 修正：attribute -> attributes（保持与其他主题一致）
+    String topicState()       { return "attributes/" + _deviceId + "/state"; }
+    String topicOtaStatus()   { return "ota/" + _deviceId + "/status"; }
 
 private:
     static MqttManager* _instance;
@@ -36,11 +42,11 @@ private:
 
     WiFiClient   _wifi;
     PubSubClient _client;
-    String       _host, _deviceId, _roomNo;
+    String       _host, _deviceId, _roomNo, _token;
     uint16_t     _port = 1883;
     unsigned long _lastReconnect = 0;
     static constexpr unsigned long RECONNECT_INTERVAL = 5000;
 
     MsgCallback _msgCb;
-    OtaCallback _otaCb;  // 新增
+    OtaCallback _otaCb;
 };
