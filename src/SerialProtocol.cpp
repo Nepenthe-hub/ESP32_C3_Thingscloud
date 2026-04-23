@@ -1,129 +1,141 @@
 #include "SerialProtocol.h"
 
-void SerialProtocol::begin(uint32_t baud) {
-    // Serial1 接外设模块（对应原理图 ESPU1，IO6=RX IO7=TX）
-    // Serial（USB CDC）用于 PC 调试，不在此处初始化，由 main.cpp setup() 负责
-    Serial1.begin(baud, SERIAL_8N1, 6, 7);
+// ─────────────────────────────────────────────────────────────────────────────
+//  begin
+// ─────────────────────────────────────────────────────────────────────────────
+void SerialProtocol::begin(uint32_t baud, int rx_pin, int tx_pin) {
+    if (rx_pin >= 0 && tx_pin >= 0) {
+        _port.begin(baud, SERIAL_8N1, rx_pin, tx_pin);
+    } else {
+        _port.begin(baud, SERIAL_8N1);
+    }
+    _bufLen = 0;
+    resetStats();
+    Serial.printf("[ESPU] begin baud=%u rx=%d tx=%d\n", baud, rx_pin, tx_pin);
 }
 
-// ─────────────────────────────────────────────
-//  loop：从 Serial1 逐字节读入，拼帧后解析
-//  状态机逻辑：
-//  等待 AA -> 等待 BB -> 读 Type/Len -> 读 Data -> 校验 -> dispatch
-// ─────────────────────────────────────────────
+// ─────────────────────────────────────────────────────────────────────────────
+//  loop：逐字节状态机，帧头同步 → 长度验证 → 校验 → dispatch
+// ─────────────────────────────────────────────────────────────────────────────
 void SerialProtocol::loop() {
-    while (Serial1.available()) {
-        uint8_t c = Serial1.read();
+    while (_port.available()) {
+        uint8_t c = _port.read();
 
-        // 缓冲区溢出保护：丢掉当前帧，重新开始
-        if (_bufLen >= sizeof(_buf)) {
+        // 缓冲区溢出保护
+        if (_bufLen >= (uint16_t)sizeof(_buf)) {
             _bufLen = 0;
         }
-
         _buf[_bufLen++] = c;
 
         // 至少需要 2 字节才能判断帧头
         if (_bufLen < 2) continue;
 
-        // 检查帧头 AA BB
+        // 帧头 AA BB 校验，不对则滑窗丢弃
         if (_buf[0] != ESP32_PKT_HEADER1 || _buf[1] != ESP32_PKT_HEADER2) {
-            // 帧头不对，丢弃第一个字节，尝试重新同步
             memmove(_buf, _buf + 1, _bufLen - 1);
             _bufLen--;
             continue;
         }
 
-        // 帧头对了但还没收到 Type 和 Len
+        // 等待 Type + Len 字节
         if (_bufLen < 4) continue;
 
-        uint8_t type = _buf[2];
-        uint8_t len  = _buf[3];
+        uint8_t  type    = _buf[2];
+        uint8_t  dataLen = _buf[3];
 
-        // 检查 len 合法性
-        if (len > ESP32_PKT_MAX_DATA) {
-            // 非法长度，丢弃帧头，重新同步
+        // 非法负载长度
+        if (dataLen > ESP32_PKT_MAX_DATA) {
+            
             memmove(_buf, _buf + 1, _bufLen - 1);
             _bufLen--;
+            _statRxErr++;
             continue;
         }
 
-        // 完整帧长 = 2(header) + 1(type) + 1(len) + len(data) + 1(checksum)
-        uint16_t fullLen = (uint16_t)(5U + len);
-
-        // 数据还没收完，继续等
+        // 完整帧 = 2+1+1+dataLen+1
+        uint16_t fullLen = (uint16_t)(5U + dataLen);
         if (_bufLen < fullLen) continue;
 
-        // 收到完整帧，校验 checksum
-        uint8_t cs = _calcChecksum(type, len, &_buf[4]);
-        if (cs != _buf[4 + len]) {
-            Serial.printf("[Serial] checksum error: calc=0x%02X recv=0x%02X\n",
-                          cs, _buf[4 + len]);
-            // 校验失败，丢弃帧头，尝试重新同步
+        // 校验
+        uint8_t cs = _calcChecksum(type, dataLen, &_buf[4]);
+        if (cs != _buf[4 + dataLen]) {
+            Serial.printf("[ESPU] Checksum mismatch type=0x%02X calc=0x%02X got=0x%02X\n",
+                          type, cs, _buf[4 + dataLen]);
             memmove(_buf, _buf + 1, _bufLen - 1);
             _bufLen--;
+            _statRxErr++;
             continue;
         }
 
-        // 校验通过，分发处理
-        _dispatch(type, len, &_buf[4]);
+        // 校验通过
+        _statRxOk++;
+        _dispatch(type, dataLen, &_buf[4]);
 
-        // 消费掉这一帧，保留后续多余字节
+        // 消费掉这帧，保留后续字节
         uint16_t remaining = _bufLen - fullLen;
-        if (remaining > 0) {
-            memmove(_buf, _buf + fullLen, remaining);
-        }
+        if (remaining > 0) memmove(_buf, _buf + fullLen, remaining);
         _bufLen = remaining;
     }
 }
 
-// ─────────────────────────────────────────────
+// ─────────────────────────────────────────────────────────────────────────────
 //  _calcChecksum：XOR(type, len, data[0..n-1])
-// ─────────────────────────────────────────────
-uint8_t SerialProtocol::_calcChecksum(uint8_t type, uint8_t len, const uint8_t *data) {
+// ─────────────────────────────────────────────────────────────────────────────
+uint8_t SerialProtocol::_calcChecksum(uint8_t type, uint8_t len,
+                                       const uint8_t* data) const {
     uint8_t cs = type ^ len;
-    for (uint8_t i = 0; i < len; i++) {
-        cs ^= data[i];
-    }
+    for (uint8_t i = 0; i < len; i++) cs ^= data[i];
     return cs;
 }
 
-// ─────────────────────────────────────────────
-//  _dispatch：根据包类型调用对应回调
-// ─────────────────────────────────────────────
-void SerialProtocol::_dispatch(uint8_t type, uint8_t len, const uint8_t *payload) {
+// ─────────────────────────────────────────────────────────────────────────────
+//  _dispatch
+// ─────────────────────────────────────────────────────────────────────────────
+void SerialProtocol::_dispatch(uint8_t type, uint8_t len,
+                                const uint8_t* payload) {
     switch (type) {
 
-        // 0x10 WiFi配置（STM32 -> ESP32）
-        case PKT_TYPE_WIFI_CFG: {
-            if (len < sizeof(wifi_cfg_packet_t)) {
-                Serial.printf("[Serial] PKT_TYPE_WIFI_CFG len too short: %d\n", len);
+        // ── 0x01 传感器数据 ────────────────────────────────────────────────────
+        case PKT_TYPE_SENSOR: {
+            if (len < sizeof(sensor_packet_t)) {
+                Serial.printf("[ESPU] PKT_SENSOR too short: %u\n", len);
                 break;
             }
-            const wifi_cfg_packet_t *wf = (const wifi_cfg_packet_t *)payload;
+            const sensor_packet_t* sp = (const sensor_packet_t*)payload;
+            Serial.printf("[ESPU] Sensor T=%u H=%u PM2.5=%u CO2=%u TVOC=%u\n",
+                          sp->temp, sp->humi, sp->pm2_5, sp->co2, sp->tvoc);
+            if (_sensorCb) _sensorCb(*sp);
+            break;
+        }
+
+        // ── 0x10 WiFi 配置 ────────────────────────────────────────────────────
+        case PKT_TYPE_WIFI_CFG: {
+            if (len < sizeof(wifi_cfg_packet_t)) {
+                Serial.printf("[ESPU] PKT_WIFI_CFG too short: %u\n", len);
+                break;
+            }
+            const wifi_cfg_packet_t* wf = (const wifi_cfg_packet_t*)payload;
+            Serial.printf("[ESPU] WiFi cfg ssid=%s\n", wf->ssid);
             if (_cfgCb) {
                 CfgMsg msg;
                 msg.ssid = String(wf->ssid);
                 msg.pwd  = String(wf->pwd);
-                msg.room = "";  // WiFi包里没有房间号，由 0x11 单独发
-                Serial.printf("[Serial] WiFi cfg: ssid=%s\n", wf->ssid);
+                msg.room = "";
                 _cfgCb(msg);
             }
             break;
         }
 
-        // 0x11 房间号（STM32 -> ESP32）
+        // ── 0x11 房间号 ───────────────────────────────────────────────────────
         case PKT_TYPE_ROOM_NUM: {
             if (len < sizeof(room_num_packet_t)) {
-                Serial.printf("[Serial] PKT_TYPE_ROOM_NUM len too short: %d\n", len);
+                Serial.printf("[ESPU] PKT_ROOM_NUM too short: %u\n", len);
                 break;
             }
-            const room_num_packet_t *rn = (const room_num_packet_t *)payload;
-            // 房间号是 4 字节 ASCII，无 \0，手动构造 String
+            const room_num_packet_t* rn = (const room_num_packet_t*)payload;
             char roomStr[5] = {0};
             memcpy(roomStr, rn->room, 4);
-            Serial.printf("[Serial] Room num: %s\n", roomStr);
-            // 房间号单独到来时，只更新 room，ssid/pwd 留空
-            // main.cpp 的 onCfg 回调需要处理 ssid 为空的情况（只更新房间号）
+            Serial.printf("[ESPU] Room num: %s\n", roomStr);
             if (_cfgCb) {
                 CfgMsg msg;
                 msg.ssid = "";
@@ -134,54 +146,96 @@ void SerialProtocol::_dispatch(uint8_t type, uint8_t len, const uint8_t *payload
             break;
         }
 
-        // 0x01 传感器数据（STM32 -> ESP32，可选处理）
-        case PKT_TYPE_SENSOR: {
-            if (len < sizeof(sensor_packet_t)) {
-                Serial.printf("[Serial] PKT_TYPE_SENSOR len too short: %d\n", len);
-                break;
-            }
-            const sensor_packet_t *sp = (const sensor_packet_t *)payload;
-            Serial.printf("[Serial] Sensor: T=%d H=%d PM2.5=%d CO2=%d TVOC=%d\n",
-                          sp->temp, sp->humi, sp->pm2_5, sp->co2, sp->tvoc);
-            if (_sensorCb) {
-                _sensorCb(*sp);
-            }
+        // ── 0xE0 回环请求 → 立即回应 0xE1 ────────────────────────────────────
+        case PKT_TYPE_ECHO_REQ: {
+            Serial.println("[ESPU] Echo REQ -> sending RSP");
+            sendPacket(PKT_TYPE_ECHO_RSP, payload, len);
+            break;
+        }
+
+        // ── 0xE1 回环应答（echoTest() 等候这个包）────────────────────────────
+        case PKT_TYPE_ECHO_RSP: {
+            Serial.println("[ESPU] Echo RSP received");
+            _echoReceived = true;
             break;
         }
 
         default:
-            Serial.printf("[Serial] unknown type=0x%02X len=%d\n", type, len);
+            Serial.printf("[ESPU] Unknown type=0x%02X len=%u\n", type, len);
+            if (_rawCb) _rawCb(type, payload, len);
             break;
     }
 }
 
-// ─────────────────────────────────────────────
-//  sendPacket：组帧发送给 STM32
-// ─────────────────────────────────────────────
-void SerialProtocol::sendPacket(uint8_t type, const uint8_t *data, uint8_t len) {
-    if (len > ESP32_PKT_MAX_DATA) return;
+// ─────────────────────────────────────────────────────────────────────────────
+//  sendPacket：组帧发送
+//  返回 true = 写入串口成功（不代表对方收到）
+// ─────────────────────────────────────────────────────────────────────────────
+bool SerialProtocol::sendPacket(uint8_t type,
+                                 const uint8_t* data, uint8_t len) {
+    if (len > ESP32_PKT_MAX_DATA) return false;
 
     uint8_t pkt[ESP32_PKT_MAX_DATA + 5U];
     pkt[0] = ESP32_PKT_HEADER1;
     pkt[1] = ESP32_PKT_HEADER2;
     pkt[2] = type;
     pkt[3] = len;
-    if (len > 0 && data != nullptr) {
-        memcpy(&pkt[4], data, len);
-    }
-    pkt[4 + len] = _calcChecksum(type, len, (len > 0 && data != nullptr) ? data : (const uint8_t *)"");
-
-    Serial1.write(pkt, len + 5U);
+    if (len > 0 && data != nullptr) memcpy(&pkt[4], data, len);
+    pkt[4 + len] = _calcChecksum(type, len,
+                                  (len > 0 && data) ? data
+                                                    : (const uint8_t*)"");
+    size_t written = _port.write(pkt, (size_t)(len + 5U));
+    _statTx++;
+    return (written == (size_t)(len + 5U));
 }
 
-// ─────────────────────────────────────────────
-//  sendStatus：主动告知 STM32 当前 WiFi/MQTT 状态
-//  在 WiFi 和 MQTT 状态变化时调用
-// ─────────────────────────────────────────────
+// ─────────────────────────────────────────────────────────────────────────────
+//  sendStatus
+// ─────────────────────────────────────────────────────────────────────────────
 void SerialProtocol::sendStatus(uint8_t wifi, uint8_t mqtt) {
-    status_packet_t pkt;
-    pkt.wifi_status = wifi;
-    pkt.mqtt_status = mqtt;
-    sendPacket(PKT_TYPE_STATUS, (const uint8_t *)&pkt, sizeof(pkt));
-    Serial.printf("[Serial] status sent: WiFi=%d MQTT=%d\n", wifi, mqtt);
+    status_packet_t pkt{ wifi, mqtt };
+    sendPacket(PKT_TYPE_STATUS, (const uint8_t*)&pkt, sizeof(pkt));
+    
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+//  sendTimeSync
+// ─────────────────────────────────────────────────────────────────────────────
+void SerialProtocol::sendTimeSync(const time_sync_packet_t& t) {
+    sendPacket(PKT_TYPE_TIME, (const uint8_t*)&t, sizeof(t));
+    Serial.printf("[ESPU] TimeSync %u-%02u-%02u %02u:%02u:%02u\n",
+                  t.year, t.month, t.day, t.hour, t.min, t.sec);
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+//  echoTest
+//  需要把 ESPU0 的 TX(IO18) 短接到 RX(IO19)，或者由对端自动回应
+//
+//  流程：
+//    1. 发送 ECHO_REQ 包（负载 = 4 字节魔术数）
+//    2. 在 timeoutMs 内循环调用 loop() 等待 ECHO_RSP
+//    3. 返回是否在超时前收到正确应答
+// ─────────────────────────────────────────────────────────────────────────────
+bool SerialProtocol::echoTest(uint32_t timeoutMs) {
+    const uint8_t magic[4] = { 0xDE, 0xAD, 0xBE, 0xEF };
+
+    _echoReceived = false;
+    bool sent = sendPacket(PKT_TYPE_ECHO_REQ, magic, sizeof(magic));
+    if (!sent) {
+        Serial.println("[ESPU] echoTest: sendPacket failed");
+        return false;
+    }
+    Serial.printf("[ESPU] echoTest: waiting %ums for RSP\n", timeoutMs);
+
+    uint32_t deadline = millis() + timeoutMs;
+    while (millis() < deadline) {
+        loop();
+        if (_echoReceived) {
+            
+            return true;
+        }
+        delay(1);
+    }
+    
+    return false;
 }

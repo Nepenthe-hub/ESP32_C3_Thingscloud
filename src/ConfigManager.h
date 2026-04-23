@@ -8,7 +8,7 @@ struct DeviceCfg {
     String roomNo;
     String deviceId;
     String mqttHost;
-    String mqttToken;   // 🔧 新增：ThingsCloud Device Token，每块板子独立
+    String mqttToken;
     uint16_t mqttPort;
     bool valid;
 };

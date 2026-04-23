@@ -9,10 +9,9 @@ using OtaCallback = std::function<void(const String& url, const String& version)
 
 class MqttManager {
 public:
-    // 🔧 新增 token 参数，对应 ThingsCloud 每设备独立的 Device Token
     void begin(const String& host, uint16_t port,
                const String& deviceId, const String& roomNo,
-               const String& token);
+               const String& username, const String& password);
     void loop();
     bool publish(const String& topic, const String& payload);
 
@@ -22,7 +21,6 @@ public:
     bool isConnected()  { return _client.connected(); }
     void disconnect()   { _client.disconnect(); }
 
-    // ─── ThingsCloud 标准主题 ───
     String topicAttrReport()  { return "attributes"; }
     String topicCmd()         { return "attributes/push"; }
     String topicEvent()       { return "events"; }
@@ -30,7 +28,6 @@ public:
     String topicCmdReply(int id) {
         return "commands/reply/" + String(id);
     }
-    // 🔧 修正：attribute -> attributes（保持与其他主题一致）
     String topicState()       { return "attributes/" + _deviceId + "/state"; }
     String topicOtaStatus()   { return "ota/" + _deviceId + "/status"; }
 
@@ -42,7 +39,7 @@ private:
 
     WiFiClient   _wifi;
     PubSubClient _client;
-    String       _host, _deviceId, _roomNo, _token;
+    String       _host, _deviceId, _roomNo, _username, _password;
     uint16_t     _port = 1883;
     unsigned long _lastReconnect = 0;
     static constexpr unsigned long RECONNECT_INTERVAL = 5000;
