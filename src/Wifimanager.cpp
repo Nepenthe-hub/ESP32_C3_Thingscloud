@@ -10,6 +10,8 @@ void WifiManager::begin(const String& ssid, const String& password) {
     _ssid     = ssid;
     _password = password;
     WiFi.mode(WIFI_STA);
+    WiFi.setTxPower(WIFI_POWER_8_5dBm); // 把发射功率降到极低
+WiFi.begin(ssid.c_str(), password.c_str());
     WiFi.begin(ssid.c_str(), password.c_str());
     _connectStart = millis();
     _setState(WifiState::CONNECTING);
